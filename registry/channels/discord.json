@@ -19,7 +19,7 @@
   "artifacts": {
     "wasm32-wasip2": {
       "url": "https://github.com/nearai/ironclaw/releases/latest/download/discord-wasm32-wasip2.tar.gz",
-      "sha256": "030707431717bca3411a48f311c6ab5f92a45c747de26cafe4f6e3e23a8b3b2d"
+      "sha256": "1d98734f95cda2978da3d7d850591c45e6d4b51b4cf9e6d0b2c6ed29ce9f9108"
     }
   },
   "auth_summary": {
