@@ -14,8 +14,10 @@ use crate::secrets::SecretsStore;
 use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
+#[cfg(feature = "composio")]
+use crate::tools::builtin::ComposioTool;
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, ComposioTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
     JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
     MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
     ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
@@ -571,15 +573,24 @@ impl ToolRegistry {
         tracing::debug!("Registered 1 vision tool (analyze)");
     }
 
-    /// Register the Composio tool for third-party app integrations.
+    /// Register the Composio tool from environment variables.
     ///
-    /// Enabled when `COMPOSIO_API_KEY` env var is set. Provides OAuth connection
-    /// and action execution for 250+ apps via Composio's REST API.
-    pub fn register_composio_tools(&self, api_key: String, entity_id: String) -> Result<(), String> {
-        let tool = ComposioTool::new(api_key, entity_id)?;
-        self.register_sync(Arc::new(tool));
-        tracing::debug!("Registered composio tool");
-        Ok(())
+    /// Returns `true` if the tool was registered, `false` if `COMPOSIO_API_KEY`
+    /// is unset/empty. Logs a warning if the HTTP client fails to build.
+    #[cfg(feature = "composio")]
+    pub fn register_composio_from_env(&self) -> bool {
+        match ComposioTool::from_env() {
+            Some(Ok(tool)) => {
+                self.register_sync(Arc::new(tool));
+                tracing::debug!("Registered composio tool");
+                true
+            }
+            Some(Err(e)) => {
+                tracing::warn!("Failed to create Composio tool: {e}");
+                false
+            }
+            None => false,
+        }
     }
 
     /// Register the software builder tool.

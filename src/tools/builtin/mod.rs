@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+#[cfg(feature = "composio")]
 mod composio;
 mod echo;
 pub mod extension_tools;
@@ -18,6 +19,7 @@ pub mod skill_tools;
 mod time;
 mod tool_info;
 
+#[cfg(feature = "composio")]
 pub use composio::ComposioTool;
 pub use echo::EchoTool;
 pub use extension_tools::{

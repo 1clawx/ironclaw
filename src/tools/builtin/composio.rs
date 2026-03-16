@@ -1,9 +1,23 @@
 //! Composio integration — connects to 250+ apps via Composio's REST API.
 //!
-//! Enabled when `COMPOSIO_API_KEY` env var is set. Provides a single multiplexed
-//! tool with actions: list, execute, connect, connected_accounts.
+//! Enabled when the `composio` cargo feature is active **and** `COMPOSIO_API_KEY` env var
+//! is set. Provides a single multiplexed tool with actions: list, execute, connect,
+//! connected_accounts.
 //!
-//! Auth: uses `x-api-key` header per Composio v3 API specification.
+//! ## Why a native built-in tool?
+//!
+//! Composio acts as an API aggregator for 250+ third-party apps. Keeping it native
+//! (rather than WASM or MCP) provides:
+//! - Direct access to the agent's `SecretString`-based credential management
+//! - Zero startup latency (no WASM compilation or MCP handshake)
+//! - Consistent error mapping into the agent's `ToolError` hierarchy
+//!
+//! The tool makes only outbound HTTPS calls to a hardcoded API base URL, so the
+//! sandbox benefits of WASM (fuel metering, memory limits) provide limited value
+//! here — the reqwest client already enforces timeouts and response size caps.
+//!
+//! Gated behind `#[cfg(feature = "composio")]` so it adds zero code for users
+//! who never enable it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,13 +26,13 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use url::Url;
 
 use crate::context::JobContext;
-use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
 use crate::tools::ApprovalRequirement;
+use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
 
 const API_BASE: &str = "https://backend.composio.dev/api/v3";
 
@@ -41,6 +55,7 @@ impl ComposioTool {
     pub fn new(api_key: String, entity_id: String) -> Result<Self, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            .user_agent("ironclaw/0.1")
             .build()
             .map_err(|e| format!("failed to create composio HTTP client: {e}"))?;
         Ok(Self {
@@ -49,6 +64,19 @@ impl ComposioTool {
             entity_id,
             account_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Try to create a `ComposioTool` from environment variables.
+    ///
+    /// Returns `None` if `COMPOSIO_API_KEY` is unset or empty.
+    /// Returns `Some(Err(..))` if the key is present but the HTTP client fails to build.
+    pub fn from_env() -> Option<Result<Self, String>> {
+        let api_key = std::env::var("COMPOSIO_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())?;
+        let entity_id =
+            std::env::var("COMPOSIO_ENTITY_ID").unwrap_or_else(|_| "default".to_string());
+        Some(Self::new(api_key, entity_id))
     }
 
     /// Build a properly percent-encoded URL with query parameters.
@@ -94,19 +122,20 @@ impl ComposioTool {
         let status = resp.status();
 
         // Early reject if Content-Length exceeds limit
-        if let Some(len) = resp.content_length() {
-            if len as usize > MAX_RESPONSE_SIZE {
-                return Err(ToolError::ExternalService(format!(
-                    "Composio API response too large: {len} bytes (max {MAX_RESPONSE_SIZE})"
-                )));
-            }
+        if let Some(len) = resp.content_length()
+            && len as usize > MAX_RESPONSE_SIZE
+        {
+            return Err(ToolError::ExternalService(format!(
+                "Composio API response too large: {len} bytes (max {MAX_RESPONSE_SIZE})"
+            )));
         }
 
         // Stream body with hard cap to prevent OOM on missing/wrong Content-Length
         let mut buf = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e: reqwest::Error| ToolError::ExternalService(e.to_string()))?;
+            let chunk =
+                chunk.map_err(|e: reqwest::Error| ToolError::ExternalService(e.to_string()))?;
             buf.extend_from_slice(&chunk);
             if buf.len() > MAX_RESPONSE_SIZE {
                 return Err(ToolError::ExternalService(format!(
@@ -119,8 +148,17 @@ impl ComposioTool {
             .map_err(|e| ToolError::ExternalService(format!("non-UTF8 response: {e}")))?;
 
         if !status.is_success() {
-            // Truncate error body to avoid leaking sensitive data in logs/events
-            let truncated = if body.len() > 512 { &body[..512] } else { &body };
+            // Truncate error body to avoid leaking sensitive data in logs/events.
+            // Use char boundary check to avoid panic on multi-byte UTF-8.
+            let truncated: &str = if body.len() > 512 {
+                let mut end = 512;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &body[..end]
+            } else {
+                &body
+            };
             return Err(ToolError::ExternalService(format!(
                 "Composio API {status}: {truncated}"
             )));
@@ -164,9 +202,7 @@ impl ComposioTool {
     /// Initiate OAuth connection for an app.
     async fn connect_app(&self, app: &str, entity_id: &str) -> Result<Value, ToolError> {
         // Resolve auth config for this app
-        let configs = self
-            .get("/auth_configs", &[("toolkit_slug", app)])
-            .await?;
+        let configs = self.get("/auth_configs", &[("toolkit_slug", app)]).await?;
         let auth_config_id = configs
             .as_array()
             .and_then(|arr| arr.first())
@@ -195,21 +231,29 @@ impl ComposioTool {
     }
 
     /// Auto-resolve connected account for a tool slug.
-    async fn resolve_account(
-        &self,
-        tool_slug: &str,
-        entity_id: &str,
-    ) -> Result<String, ToolError> {
-        // Extract app from tool slug (e.g., "GMAIL_SEND_EMAIL" -> "gmail")
-        let app = tool_slug
-            .split('_')
-            .next()
-            .unwrap_or(tool_slug)
-            .to_ascii_lowercase();
+    ///
+    /// Uses the Composio API to look up connected accounts for the tool's app,
+    /// rather than parsing app names from the tool slug (which is fragile for
+    /// multi-word app names like `GOOGLE_DRIVE_UPLOAD`).
+    async fn resolve_account(&self, tool_slug: &str, entity_id: &str) -> Result<String, ToolError> {
+        // Look up the tool to get its app slug from the API (avoids fragile
+        // string splitting for multi-word app names like GOOGLE_DRIVE).
+        let tools_resp = self.get("/tools", &[("search", tool_slug)]).await?;
+        let app = tools_resp
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|t| t.get("appName").or_else(|| t.get("toolkit_slug")))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                // Fallback: take first segment before '_' and lowercase it.
+                // Works for simple cases like GMAIL_SEND_EMAIL -> gmail.
+                tool_slug.split('_').next().unwrap_or(tool_slug)
+            });
+        let app_lower = app.to_ascii_lowercase();
 
         // Only cache for the configured default entity to prevent unbounded growth
         let use_cache = entity_id == self.entity_id;
-        let cache_key = format!("{entity_id}:{app}");
+        let cache_key = format!("{entity_id}:{app_lower}");
 
         // Check cache
         if use_cache {
@@ -220,7 +264,7 @@ impl ComposioTool {
         }
 
         // Fetch from API
-        let accounts = self.list_accounts(Some(&app), entity_id).await?;
+        let accounts = self.list_accounts(Some(&app_lower), entity_id).await?;
         let account_id = accounts
             .as_array()
             .and_then(|arr| {
@@ -232,7 +276,7 @@ impl ComposioTool {
             .and_then(|id| id.as_str())
             .ok_or_else(|| {
                 ToolError::ExternalService(format!(
-                    "no connected account for {app} — use composio with action=\"connect\" first"
+                    "no connected account for {app_lower} — use composio with action=\"connect\" first"
                 ))
             })?
             .to_string();
@@ -292,10 +336,7 @@ impl Tool for ComposioTool {
     }
 
     fn requires_approval(&self, params: &Value) -> ApprovalRequirement {
-        let action = params
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
         match action {
             // execute and connect perform write operations / OAuth flows
             "execute" | "connect" => ApprovalRequirement::UnlessAutoApproved,
@@ -306,11 +347,7 @@ impl Tool for ComposioTool {
         }
     }
 
-    async fn execute(
-        &self,
-        params: Value,
-        _ctx: &JobContext,
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, params: Value, _ctx: &JobContext) -> Result<ToolOutput, ToolError> {
         let start = Instant::now();
         let action = require_str(&params, "action")?;
         // Always use configured entity_id — no caller override to prevent cache abuse
@@ -324,9 +361,7 @@ impl Tool for ComposioTool {
             "execute" => {
                 let tool_slug = require_str(&params, "tool_slug")?;
                 let action_params = params.get("params").cloned().unwrap_or(json!({}));
-                let account_id = params
-                    .get("connected_account_id")
-                    .and_then(|v| v.as_str());
+                let account_id = params.get("connected_account_id").and_then(|v| v.as_str());
                 self.execute_action(tool_slug, &action_params, entity_id, account_id)
                     .await?
             }
@@ -505,7 +540,9 @@ mod tests {
     fn test_url_encoding() {
         // Verify special characters are properly percent-encoded
         let url = ComposioTool::build_url("/tools", &[("toolkit_slug", "my app+1")]).unwrap();
-        assert!(url.contains("toolkit_slug=my+app%2B1") || url.contains("toolkit_slug=my%20app%2B1"));
+        assert!(
+            url.contains("toolkit_slug=my+app%2B1") || url.contains("toolkit_slug=my%20app%2B1")
+        );
         assert!(!url.contains("my app+1")); // raw value should NOT appear
     }
 
