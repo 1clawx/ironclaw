@@ -16,6 +16,7 @@ pub mod secrets_tools;
 pub(crate) mod shell;
 pub mod skill_tools;
 mod time;
+mod tool_info;
 
 pub use composio::ComposioTool;
 pub use echo::EchoTool;
@@ -41,6 +42,7 @@ pub use secrets_tools::{SecretDeleteTool, SecretListTool};
 pub use shell::ShellTool;
 pub use skill_tools::{SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool};
 pub use time::TimeTool;
+pub use tool_info::ToolInfoTool;
 mod html_converter;
 pub mod image_analyze;
 pub mod image_edit;
